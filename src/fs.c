@@ -3,6 +3,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
+#include <semaphore.h>
 
 #define _UTHREAD_PRIVATE
 #include "disk.h"
@@ -53,6 +54,12 @@ struct FAT_t {
 	uint16_t words;
 };
 
+// file name struct indicate location of filename in filesName
+struct FILE_NAMES {
+	char     file_name[FS_FILENAME_LEN];
+	bool   is_free; 
+};
+
 
 /* 
  *
@@ -85,12 +92,20 @@ struct superblock_t      *superblock;
 struct rootdirectory_t   *root_dir_block;
 struct FAT_t             *FAT_blocks;
 struct file_descriptor_t fd_table[FS_OPEN_MAX_COUNT]; 
+struct FILE_NAMES  file_names[FS_FILE_MAX_COUNT];
+
+size_t file_names_offset = 0;
+
+// semaphores
+sem_t mutexCreate;
+sem_t mutexWrite;
 
 
 // private API
 static bool error_free(const char *filename);
 static int  locate_file(const char* file_name);
 static bool is_open(const char* file_name);
+static bool is_locked(const char* file_name);
 static int  locate_avail_fd();
 static int  get_num_FAT_free_blocks();
 static int  count_num_open_dir();
@@ -146,6 +161,14 @@ int fs_mount(const char *diskname) {
     for(int i = 0; i < FS_OPEN_MAX_COUNT; i++) {
 		fd_table[i].is_used = false;
 	}
+	// initialize files_names
+	 for(int i = 0; i < FS_FILE_MAX_COUNT; i++) {
+		file_names[i].is_free = true;
+	}
+	fs_create("file_names");
+	// initialize semaphores
+	sem_init(&mutexCreate, 0, 1);
+	sem_init(&mutexWrite, 0, 1);
         
 	return 0;
 }
@@ -187,6 +210,15 @@ int fs_umount(void) {
 		fd_table[i].file_index = -1;
 		memset(fd_table[i].file_name, 0, FS_FILENAME_LEN);
     }
+	// reset file_names
+    for(int i = 0; i < FS_FILE_MAX_COUNT; i++) {
+		file_names[i].is_free = true;
+		memset(file_names[i].file_name, 0, FS_FILENAME_LEN);
+    }
+	// destroy semaphores
+	 sem_destroy(&mutexCreate);
+	 sem_destroy(&mutexWrite);
+
 
 	block_disk_close();
 	return 0;
@@ -223,20 +255,39 @@ int fs_create(const char *filename) {
 		fs_error("error associated with filename");
 		return -1;
 	}
-
+	//signal
+    sem_wait(&mutexCreate);
 	// finds first available empty file
 	for(int i = 0; i < FS_FILE_MAX_COUNT; i++) {
 		if(root_dir_block[i].filename[0] == EMPTY) {	
-
 			// initialize file data 
 			strcpy(root_dir_block[i].filename, filename);
 			root_dir_block[i].file_size     = 0;
 			root_dir_block[i].start_data_block = EOC;
-
+			//signal
+	        sem_post(&mutexCreate);
 			return 0;
 		}
 	}
+	// write into file_names
+	int fd = fs_open("file_names");
+	fs_lseek(fd,file_names_offset);
+	fs_write(fd,(void *)filename,FILENAME_MAX);
+	file_names_offset += FILENAME_MAX;
+	for(int i = 0; i < FS_FILE_MAX_COUNT; i++) {
+		if (file_names[i].is_free == true)
+		{
+	      	file_names[i].is_free = false;
+			strcpy(file_names[i].file_name, filename);
+			break;
+		}
+    }
+	
+	fs_close(fd);
+	// signal
+    sem_post(&mutexCreate);
 	return -1;
+ 
 }
 
 
@@ -268,6 +319,15 @@ int fs_delete(const char *filename) {
 	// reset file to blank slate
 	memset(the_dir->filename, 0, FS_FILENAME_LEN);
 	the_dir->file_size = 0;
+	// delete out of file_names
+	for(int i = 0; i < FS_FILE_MAX_COUNT; i++) {
+		if (strncmp(file_names[i].file_name, filename, FS_FILENAME_LEN) )
+		{
+	      	file_names[i].is_free = true;
+			memset(file_names[i].file_name, 0, FS_FILENAME_LEN);
+			break;
+		}
+    }
 
 	return 0;
 }
@@ -421,7 +481,8 @@ int fs_write(int fd, void *buf, size_t count) {
         fs_error("file is locked");
         return -1;	
 	}
-
+	//wait
+    sem_wait(&mutexWrite);
 	// find relative information about file 
 	char *file_name = fd_table[fd].file_name;				
 	int file_index = locate_file(file_name);				
@@ -506,7 +567,7 @@ int fs_write(int fd, void *buf, size_t count) {
 		} else {
 			left_shift = amount_to_write;
 		}
-
+        block_read(curr_fat_index + superblock->data_start_index, (void*)bounce_buff);
 		memcpy(bounce_buff + location, write_buf, left_shift);
 		block_write(curr_fat_index + superblock->data_start_index, (void*)bounce_buff);
 		
@@ -534,6 +595,8 @@ int fs_write(int fd, void *buf, size_t count) {
 	}
 
 	fd_table[fd].offset += total_byte_written;
+	// signal
+    sem_post(&mutexWrite);
 	return total_byte_written;
 }
 
