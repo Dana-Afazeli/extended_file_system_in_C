@@ -250,6 +250,9 @@ int fs_delete(const char *filename) {
 	if (is_open(filename)) {
 		fs_error("file currently open");
 		return -1;
+	} else if (is_locked(filename)) {
+		fs_error("file is locked");
+		return -1;
 	}
 
 	int file_index = locate_file(filename);
@@ -413,6 +416,10 @@ int fs_write(int fd, void *buf, size_t count) {
 	} else if (fd_table[fd].is_used == false) {
         fs_error("file descriptor is not open");
         return -1;
+	}
+	  else if (is_locked(fd_table[fd].file_name)) {
+        fs_error("file is locked");
+        return -1;	
 	}
 
 	// find relative information about file 
@@ -700,6 +707,13 @@ static bool is_open(const char* filename)
 	}
 
 	return false;
+}
+/*
+Is the file locked?
+*/
+static bool is_locked( const char *filename)
+{
+    return strncmp("lock", filename, strlen("lock")) == 0;
 }
 
 // helper: info
