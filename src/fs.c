@@ -54,13 +54,6 @@ struct FAT_t {
 	uint16_t words;
 };
 
-// file name struct indicate location of filename in filesName
-struct FILE_NAMES {
-	char	file_name[FS_FILENAME_LEN];
-	bool	is_free; 
-};
-
-
 /* 
  *
  * Root Directory:
@@ -87,18 +80,31 @@ struct file_descriptor_t {
 	char   file_name[FS_FILENAME_LEN];
 };
 
+struct cache_t {
+	bool		used;
+	uint16_t	num_blocks;
+	uint16_t	head;
+	bool		*dirty_blocks;
+	size_t		*block_number;
+	void		*data_blocks;
+};
+
 
 struct superblock_t      *superblock;
 struct rootdirectory_t   *root_dir_block;
 struct FAT_t             *FAT_blocks;
-struct file_descriptor_t fd_table[FS_OPEN_MAX_COUNT]; 
-struct FILE_NAMES  file_names[FS_FILE_MAX_COUNT];
-
-size_t file_names_offset = 0;
+struct file_descriptor_t fd_table[FS_OPEN_MAX_COUNT];
+struct cache_t			 read_cache;
+struct cache_t			 write_cache;
 
 // semaphores
-sem_t mutexCreate;
-sem_t mutexWrite;
+int open_files_read_requests[FS_OPEN_MAX_COUNT];
+int open_files_write_requests[FS_OPEN_MAX_COUNT];
+sem_t open_files_read_sem;
+sem_t open_files_write_sem;
+sem_t root_dir_semaphore;
+sem_t fat_semaphore;
+sem_t fd_semaphore;
 
 
 // private API
@@ -111,9 +117,16 @@ static int  get_num_FAT_free_blocks();
 static int  count_num_open_dir();
 static int  go_to_cur_FAT_block(int cur_fat_index, int iter_amount);
 
+static int init_read_cache(void);
+static int init_write_cache(void);
+static int block_read_cache(size_t block, const void *buf);
+static int block_write_cache(size_t block, const void *buf);
+static int invalidate_read_cache(void);
+static int invalidate_write_cache(void);
 
 // Makes the file system contained in the specified virtual disk "ready to be used"
-int fs_mount(const char *diskname) {
+// if use_cache = 0, then we use no cache else we use cache
+int fs_mount(const char *diskname, const int use_cache) {
 
 	superblock = malloc(BLOCK_SIZE);
 
@@ -124,7 +137,7 @@ int fs_mount(const char *diskname) {
 	}
 	
 	// initialize data onto local super block 
-	if(block_read(0, (void*)superblock) < 0){
+	if(block_read_cache(0, (void*)superblock) < 0){
 		fs_error( "failure to read from block \n");
 		return -1;
 	}
@@ -143,7 +156,7 @@ int fs_mount(const char *diskname) {
 	FAT_blocks = malloc(superblock->num_FAT_blocks * BLOCK_SIZE);
 	for(int i = 0; i < superblock->num_FAT_blocks; i++) {
 		// read each fat block in the disk starting at position 1
-		if(block_read(i + 1, (void*)FAT_blocks + (i * BLOCK_SIZE)) < 0) {
+		if(block_read_cache(i + 1, (void*)FAT_blocks + (i * BLOCK_SIZE)) < 0) {
 			fs_error("failure to read from block \n");
 			return -1;
 		}
@@ -152,7 +165,7 @@ int fs_mount(const char *diskname) {
 	// initialize data onto local root directory block
 	root_dir_block = malloc(sizeof(struct rootdirectory_t) * FS_FILE_MAX_COUNT);
 	// read the root directory block in the disk starting after the last FAT block
-	if(block_read(superblock->num_FAT_blocks + 1, (void*)root_dir_block) < 0) { 
+	if(block_read_cache(superblock->num_FAT_blocks + 1, (void*)root_dir_block) < 0) { 
 		fs_error("failure to read from block \n");
 		return -1;
 	}
@@ -161,15 +174,29 @@ int fs_mount(const char *diskname) {
     for(int i = 0; i < FS_OPEN_MAX_COUNT; i++) {
 		fd_table[i].is_used = false;
 	}
-	// initialize files_names
-	 for(int i = 0; i < FS_FILE_MAX_COUNT; i++) {
-		file_names[i].is_free = true;
+	
+
+	for (int i = 0; i < FS_OPEN_MAX_COUNT; i++) {
+		open_files_read_requests[i] = 0;
+		open_files_write_requests[i] = 0;
 	}
-	fs_create("file_names");
+
 	// initialize semaphores
-	sem_init(&mutexCreate, 0, 1);
-	sem_init(&mutexWrite, 0, 1);
-        
+	sem_init(&root_dir_semaphore, 0, 1);
+	sem_init(&fat_semaphore, 0, 1);
+	sem_init(&fd_semaphore, 0, 1);
+	sem_init(&open_files_read_sem, 0, 1);
+	sem_init(&open_files_write_sem, 0, 1);
+    
+	// initialize caches
+	if (use_cache != 0) {
+		init_read_cache();
+		init_write_cache();
+	} else {
+		read_cache.used = false;
+		write_cache.used = false;
+	}
+	
 	return 0;
 }
 
@@ -199,28 +226,36 @@ int fs_umount(void) {
 			return -1;
 	}
 
-	// TODO: write data blocks.
-
 	free(superblock);
 	free(root_dir_block);
 	free(FAT_blocks);
 
 	// reset file descriptors
-    for(int i = 0; i < FS_OPEN_MAX_COUNT; i++) {
+	int i = 0;
+    while(i < FS_OPEN_MAX_COUNT) {
+		if ((open_files_read_requests[i] > 0) || (open_files_write_requests[i] > 0)) {
+			continue;
+		}
 		fd_table[i].offset = 0;
 		fd_table[i].is_used = false;
 		fd_table[i].file_index = -1;
 		memset(fd_table[i].file_name, 0, FS_FILENAME_LEN);
+		i++;
     }
-	// reset file_names
-    for(int i = 0; i < FS_FILE_MAX_COUNT; i++) {
-		file_names[i].is_free = true;
-		memset(file_names[i].file_name, 0, FS_FILENAME_LEN);
-    }
-	// destroy semaphores
-	 sem_destroy(&mutexCreate);
-	 sem_destroy(&mutexWrite);
+	
+	for (int i = 0; i < FS_OPEN_MAX_COUNT; i++) {
+		open_files_read_requests[i] = 0;
+		open_files_write_requests[i] = 0;
+	}
+	sem_destroy(&root_dir_semaphore);
+	sem_destroy(&fat_semaphore);
+	sem_destroy(&fd_semaphore);
+	sem_destroy(&open_files_read_sem);
+	sem_destroy(&open_files_write_sem);
 
+	// invalidate caches
+	invalidate_read_cache();
+	invalidate_write_cache();
 
 	block_disk_close();
 	return 0;
@@ -250,15 +285,20 @@ Create a new file:
 	2. The name needs to be set, and all other information needs to get reset.
 		2.2 Intitially the size is 0 and pointer to first data block is FAT_EOC.
 */
-int fs_create(const char *filename) {
+int fs_create_safe(const char *filename) {
+	sem_wait(&root_dir_semaphore);
+	int result = fs_create(filename);
+	sem_post(&root_dir_semaphore);
+	return result;
+}
 
+int fs_create(const char *filename) {
 	// perform error checking first 
 	if(error_free(filename) == false) {
 		fs_error("error associated with filename");
 		return -1;
 	}
-	//signal
-    sem_wait(&mutexCreate);
+
 	// finds first available empty file
 	for(int i = 0; i < FS_FILE_MAX_COUNT; i++) {
 		if(root_dir_block[i].filename[0] == EMPTY) {	
@@ -266,30 +306,13 @@ int fs_create(const char *filename) {
 			strcpy(root_dir_block[i].filename, filename);
 			root_dir_block[i].file_size = 0;
 			root_dir_block[i].start_data_block = EOC;
-			//signal
-	        sem_post(&mutexCreate);
+
+			// write root dir to disk
+			block_write_cache(superblock->num_FAT_blocks + 1, (void*)root_dir_block);
 			return 0;
 		}
 	}
-	// write into file_names
-	int fd = fs_open("file_names");
-	fs_lseek(fd,file_names_offset);
-	fs_write(fd,(void *)filename,FILENAME_MAX);
-	file_names_offset += FILENAME_MAX;
-	for(int i = 0; i < FS_FILE_MAX_COUNT; i++) {
-		if (file_names[i].is_free == true)
-		{
-	      	file_names[i].is_free = false;
-			strcpy(file_names[i].file_name, filename);
-			break;
-		}
-    }
-	
-	fs_close(fd);
-	// signal
-    sem_post(&mutexCreate);
 	return -1;
- 
 }
 
 
@@ -298,6 +321,17 @@ Remove File:
 	1. Empty file entry and all its datablocks associated with file contents from FAT.
 	2. Free associated data blocks
 */
+int fs_delete_safe(const char *filename) {
+	sem_wait(&root_dir_semaphore);
+	sem_wait(&fd_semaphore);
+	sem_wait(&fat_semaphore);
+	int result = fs_delete(filename);
+	sem_post(&fat_semaphore);
+	sem_post(&fd_semaphore);
+	sem_post(&root_dir_semaphore);
+	return result;
+}
+
 int fs_delete(const char *filename) {
 	
 	if (is_open(filename)) {
@@ -316,24 +350,27 @@ int fs_delete(const char *filename) {
 		uint16_t tmp = FAT_blocks[frst_dta_blk_i].words;
 		FAT_blocks[frst_dta_blk_i].words = EMPTY;
 		frst_dta_blk_i = tmp;
+
+		// write the change into disk
+		block_write_cache(frst_dta_blk_i, (void*)FAT_blocks + (frst_dta_blk_i * BLOCK_SIZE));
 	}
 
 	// reset file to blank slate
 	memset(the_dir->filename, 0, FS_FILENAME_LEN);
 	the_dir->file_size = 0;
-	// delete out of file_names
-	for(int i = 0; i < FS_FILE_MAX_COUNT; i++) {
-		if (strncmp(file_names[i].file_name, filename, FS_FILENAME_LEN) )
-		{
-	      	file_names[i].is_free = true;
-			memset(file_names[i].file_name, 0, FS_FILENAME_LEN);
-			break;
-		}
-    }
+	// write root dir to disk
+	block_write_cache(superblock->num_FAT_blocks + 1, (void*)root_dir_block);
 
 	return 0;
 }
 
+
+int fs_ls_safe(void) {
+	sem_wait(&root_dir_semaphore);
+	int result = fs_ls();
+	sem_post(&root_dir_semaphore);
+	return result;
+}
 
 int fs_ls(void) {
 
@@ -359,6 +396,16 @@ Open and return FD:
 		2.2 Increment number of file scriptors to of requested file object
 	3. Return file descriptor index, or other wise -1 on failure
 */
+
+int fs_open_safe(const char *filename) {
+	sem_wait(&root_dir_semaphore);
+	sem_wait(&fd_semaphore);
+	int result = fs_open(filename);
+	sem_post(&fd_semaphore);
+	sem_post(&root_dir_semaphore);
+	return result;
+}
+
 int fs_open(const char *filename) {
 
     int file_index = locate_file(filename);
@@ -390,6 +437,16 @@ Close FD object:
 	3. Locate its the associated filename of the fd and decrement its fd
 	4. Mark FD as available for use
 */
+
+int fs_close_safe(int fd) {
+	sem_wait(&root_dir_semaphore);
+	sem_wait(&fd_semaphore);
+	int result = fs_close(fd);
+	sem_post(&fd_semaphore);
+	sem_post(&root_dir_semaphore);
+	return result;
+}
+
 int fs_close(int fd) {
 
     if(fd >= FS_OPEN_MAX_COUNT || fd < 0 || fd_table[fd].is_used == 0) {
@@ -417,6 +474,15 @@ Return the size of the file corresponding to the specified file descriptor.
 	2. Locate file from root dir from fd
 	3. Return file size from appropriate root dir 
 */
+int fs_stat_safe(int fd) {
+	sem_wait(&root_dir_semaphore);
+	sem_wait(&fd_semaphore);
+	int result = fs_stat(fd);
+	sem_post(&fd_semaphore);
+	sem_post(&root_dir_semaphore);
+	return result;
+}
+
 int fs_stat(int fd) {
     if(fd >= FS_OPEN_MAX_COUNT || fd < 0 || fd_table[fd].is_used == false) {
 		fs_error("invalid file descriptor supplied \n");
@@ -441,6 +507,15 @@ Move supplied fd to supplied offset
 	2. Error check 
 	3. Update offset of fd
 */
+int fs_lseek_safe(int fd, size_t offset) {
+	sem_wait(&root_dir_semaphore);
+	sem_wait(&fd_semaphore);
+	int result = fs_lseek(fd, offset);
+	sem_post(&fd_semaphore);
+	sem_post(&root_dir_semaphore);
+	return result;
+}
+
 int fs_lseek(int fd, size_t offset) {
 	struct file_descriptor_t *fd_obj = &fd_table[fd];
     int file_index = locate_file(fd_obj->file_name);
@@ -463,6 +538,31 @@ int fs_lseek(int fd, size_t offset) {
 	return 0;
 }
 
+int fs_write_safe(int fd, void *buf, size_t count) {
+	sem_wait(&open_files_write_sem);
+	if (fd <= -1 || fd >= FS_OPEN_MAX_COUNT) {
+        fs_error("invalid file descriptor [%d] \n", fd);
+        return -1;
+	} else {
+		open_files_write_requests[fd] += 1;
+	}
+	sem_post(&open_files_write_sem);
+
+	sem_wait(&root_dir_semaphore);
+	sem_wait(&fd_semaphore);
+	sem_wait(&fat_semaphore);
+	int result = fs_write(fd, buf, count);
+	sem_post(&fat_semaphore);
+	sem_post(&fd_semaphore);
+	sem_post(&root_dir_semaphore);
+
+	sem_wait(&open_files_write_sem);
+	open_files_write_requests[fd] -= 1;
+	sem_post(&open_files_write_sem);
+	
+	return result;
+}
+
 // Write to a file:
 int fs_write(int fd, void *buf, size_t count) {
 	// Error Checking 
@@ -483,8 +583,7 @@ int fs_write(int fd, void *buf, size_t count) {
         fs_error("file is locked");
         return -1;	
 	}
-	//wait
-    sem_wait(&mutexWrite);
+
 	// find relative information about file 
 	char *file_name = fd_table[fd].file_name;				
 	int file_index = locate_file(file_name);				
@@ -569,7 +668,7 @@ int fs_write(int fd, void *buf, size_t count) {
 		} else {
 			left_shift = amount_to_write;
 		}
-        block_read(curr_fat_index + superblock->data_start_index, (void*)bounce_buff);
+        block_read_cache(curr_fat_index + superblock->data_start_index, (void*)bounce_buff);
 		memcpy(bounce_buff + location, write_buf, left_shift);
 		block_write(curr_fat_index + superblock->data_start_index, (void*)bounce_buff);
 		
@@ -597,8 +696,6 @@ int fs_write(int fd, void *buf, size_t count) {
 	}
 
 	fd_table[fd].offset += total_byte_written;
-	// signal
-    sem_post(&mutexWrite);
 	return total_byte_written;
 }
 
@@ -608,6 +705,32 @@ Read a File:
 	1. Error check that the amount to be read is > 0, and that the
 	   the file descriptor is valid.
 */
+
+int fs_read_safe(int fd, void *buf, size_t count) {
+	sem_wait(&open_files_read_sem);
+	if (fd <= -1 || fd >= FS_OPEN_MAX_COUNT) {
+        fs_error("invalid file descriptor [%d] \n", fd);
+        return -1;
+	} else {
+		open_files_read_requests[fd] += 1;
+	}
+	sem_post(&open_files_read_sem);
+
+	sem_wait(&root_dir_semaphore);
+	sem_wait(&fd_semaphore);
+	sem_wait(&fat_semaphore);
+	int result = fs_read(fd, buf, count);
+	sem_post(&fat_semaphore);
+	sem_post(&fd_semaphore);
+	sem_post(&root_dir_semaphore);
+
+	sem_wait(&open_files_read_sem);
+	open_files_read_requests[fd] -= 1;
+	sem_post(&open_files_read_sem);
+
+	return result;
+}
+
 int fs_read(int fd, void *buf, size_t count) {
 	
 	// error check 
@@ -659,7 +782,7 @@ int fs_read(int fd, void *buf, size_t count) {
 		}
 
 		// read file contents 
-		block_read(FAT_iter + superblock->data_start_index, (void*)bounce_buff);
+		block_read_cache(FAT_iter + superblock->data_start_index, (void*)bounce_buff);
 		memcpy(read_buf, bounce_buff + location, left_shift);
 
 		// position array to left block 
@@ -691,7 +814,9 @@ static int locate_file(const char* file_name) {
     for(i = 0; i < FS_FILE_MAX_COUNT; i++) 
         if(strncmp(root_dir_block[i].filename, file_name, FS_FILENAME_LEN) == 0 &&  
 			      root_dir_block[i].filename != EMPTY) 
+			sem_post(&root_dir_semaphore);
             return i;  
+	
     return -1;      
 }
 
@@ -712,7 +837,7 @@ Perform Error Checking
     3. Check if root directory has max number of files 
 */
 static bool error_free(const char *filename){
-
+	
 	// get size 
 	int size = strlen(filename);
 	if(size > FS_FILENAME_LEN){
@@ -773,6 +898,7 @@ static bool is_open(const char* filename)
 
 	return false;
 }
+
 /*
 Is the file locked?
 */
@@ -817,3 +943,107 @@ static int go_to_cur_FAT_block(int cur_fat_index, int iter_amount)
 	return cur_fat_index;
 }
 
+static int init_read_cache(void) {
+	read_cache.used = true;
+	read_cache.num_blocks = superblock->num_data_blocks/3;
+	read_cache.head = 0;
+	read_cache.dirty_blocks = (bool*) malloc(read_cache.num_blocks * sizeof(bool));
+	read_cache.data_blocks = malloc(read_cache.num_blocks * BLOCK_SIZE);
+	read_cache.block_number = (size_t*) malloc(read_cache.num_blocks * sizeof(size_t));
+	for (int i = 0; i < read_cache.num_blocks; i++) {
+		read_cache.dirty_blocks[i] = false;
+	}
+	return 0;
+}
+
+static int init_write_cache(void) {
+	write_cache.used = true;
+	write_cache.num_blocks = superblock->num_data_blocks/3;
+	write_cache.head = 0;
+	write_cache.dirty_blocks = (bool*) malloc(write_cache.num_blocks * sizeof(bool));
+	write_cache.data_blocks = malloc(write_cache.num_blocks * BLOCK_SIZE);
+	write_cache.block_number = (size_t*) malloc(write_cache.num_blocks * sizeof(size_t));
+	for (int i = 0; i < write_cache.num_blocks; i++) {
+		write_cache.dirty_blocks[i] = false;
+	}
+	return 0;
+}
+
+static int block_read_cache(size_t block, const void *buf) {
+	if (read_cache.used == false) {
+		return block_read(block, buf);
+	}
+
+	// return if present
+	for (int i = 0; i < read_cache.num_blocks; i++) {
+		if (read_cache.dirty_blocks[i] && (read_cache.block_number[i] == block)) {
+			memcpy(buf, read_cache.data_blocks + i*BLOCK_SIZE, BLOCK_SIZE);
+			return 0;
+		}
+	}
+
+	// if not present, read the data into the data_block[head]. it's either empty or replaced using FIFO policy
+	block_read(block, read_cache.data_blocks + read_cache.head*BLOCK_SIZE);
+	memcpy(buf, read_cache.data_blocks + read_cache.head*BLOCK_SIZE, BLOCK_SIZE);
+	read_cache.dirty_blocks[read_cache.head] = true;
+	read_cache.block_number[read_cache.head] = block;
+	read_cache.head = (read_cache.head + 1) % read_cache.num_blocks;
+	return 0;
+}
+
+static int block_write_cache(size_t block, const void *buf) {
+	if (write_cache.used == false) {
+		return block_write(block, buf);
+	}
+
+	// write to cache if present
+	for (int i = 0; i < write_cache.num_blocks; i++) {
+		if (write_cache.dirty_blocks[i] && (write_cache.block_number[i] == block)) {
+			memcpy(write_cache.data_blocks + i*BLOCK_SIZE, buf, BLOCK_SIZE);
+			return 0;
+		}
+	}
+
+	// if not present, write the data into the data_block[head]. before that, if its dirty, write it to disk
+	if (write_cache.dirty_blocks[write_cache.head]) {
+		block_write(write_cache.block_number[write_cache.head], write_cache.data_blocks + write_cache.head*BLOCK_SIZE);
+	}
+	memcpy(write_cache.data_blocks + write_cache.head*BLOCK_SIZE, buf, BLOCK_SIZE);
+	write_cache.dirty_blocks[write_cache.head] = true;
+	write_cache.block_number[write_cache.head] = block;
+	write_cache.head = (write_cache.head + 1) % write_cache.num_blocks;
+	return 0;
+}
+
+static int invalidate_read_cache() {
+	if (read_cache.used) {
+		read_cache.used = false;
+		free(read_cache.dirty_blocks);
+		free(read_cache.data_blocks);
+		free(read_cache.block_number);
+	}
+
+	return 0;
+}
+
+static int invalidate_write_cache() {
+	if (write_cache.used) {
+		flush_write_cache();
+		write_cache.used = false;
+		free(write_cache.dirty_blocks);
+		free(write_cache.data_blocks);
+		free(write_cache.block_number);
+	}
+}
+
+int flush_write_cache() {
+	if (!write_cache.used) return 0;
+
+	for (int i = 0; i < write_cache.num_blocks; i++) {
+		if (write_cache.dirty_blocks[i]) {
+			block_write(write_cache.block_number[i], write_cache.data_blocks + i*BLOCK_SIZE);	
+		}
+	}
+
+	return 0;
+}

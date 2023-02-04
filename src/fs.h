@@ -23,7 +23,7 @@
  * Return: -1 if virtual disk file @diskname cannot be opened, or if no valid
  * file system can be located. 0 otherwise.
  */
-int fs_mount(const char *diskname);
+int fs_mount(const char *diskname, const int use_cache);
 
 /**
  * fs_umount - Unmount file system
@@ -175,5 +175,8 @@ int fs_write(int fd, void *buf, size_t count);
  * open). Otherwise return the number of bytes actually read.
  */
 int fs_read(int fd, void *buf, size_t count);
+
+
+int flush_write_cache(void);
 
 #endif /* _FS_H */
