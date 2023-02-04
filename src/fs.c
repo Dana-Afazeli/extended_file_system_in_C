@@ -100,8 +100,8 @@ struct cache_t			 write_cache;
 // semaphores
 int open_files_read_requests[FS_OPEN_MAX_COUNT];
 int open_files_write_requests[FS_OPEN_MAX_COUNT];
-sem_t open_files_read_sem;
-sem_t open_files_write_sem;
+sem_t open_files_read_sem[FS_OPEN_MAX_COUNT];
+sem_t open_files_write_sem[FS_OPEN_MAX_COUNT];
 sem_t root_dir_semaphore;
 sem_t fat_semaphore;
 sem_t fd_semaphore;
@@ -185,8 +185,10 @@ int fs_mount(const char *diskname, const int use_cache) {
 	sem_init(&root_dir_semaphore, 0, 1);
 	sem_init(&fat_semaphore, 0, 1);
 	sem_init(&fd_semaphore, 0, 1);
-	sem_init(&open_files_read_sem, 0, 1);
-	sem_init(&open_files_write_sem, 0, 1);
+	for (int i = 0; i < FS_OPEN_MAX_COUNT; i++) {
+		sem_init(&(open_files_read_sem[i]), 0, 1);
+		sem_init(&(open_files_write_sem[i]), 0, 1);	
+	}
     
 	// initialize caches
 	if (use_cache != 0) {
@@ -236,22 +238,27 @@ int fs_umount(void) {
 		if ((open_files_read_requests[i] > 0) || (open_files_write_requests[i] > 0)) {
 			continue;
 		}
+		sem_wait(&(open_files_read_sem[i]));
+		sem_wait(&(open_files_write_sem[i]));
 		fd_table[i].offset = 0;
 		fd_table[i].is_used = false;
 		fd_table[i].file_index = -1;
 		memset(fd_table[i].file_name, 0, FS_FILENAME_LEN);
 		i++;
+		sem_post(&(open_files_write_sem[i]));
+		sem_post(&(open_files_read_sem[i]));
     }
 	
 	for (int i = 0; i < FS_OPEN_MAX_COUNT; i++) {
 		open_files_read_requests[i] = 0;
 		open_files_write_requests[i] = 0;
+
+		sem_destroy(&(open_files_read_sem[i]));
+		sem_destroy(&(open_files_write_sem[i]));
 	}
 	sem_destroy(&root_dir_semaphore);
 	sem_destroy(&fat_semaphore);
 	sem_destroy(&fd_semaphore);
-	sem_destroy(&open_files_read_sem);
-	sem_destroy(&open_files_write_sem);
 
 	// invalidate caches
 	invalidate_read_cache();
@@ -348,11 +355,10 @@ int fs_delete(const char *filename) {
 
 	while (frst_dta_blk_i != EOC) {
 		uint16_t tmp = FAT_blocks[frst_dta_blk_i].words;
-		FAT_blocks[frst_dta_blk_i].words = EMPTY;
-		frst_dta_blk_i = tmp;
-
 		// write the change into disk
 		block_write_cache(frst_dta_blk_i, (void*)FAT_blocks + (frst_dta_blk_i * BLOCK_SIZE));
+		FAT_blocks[frst_dta_blk_i].words = EMPTY;
+		frst_dta_blk_i = tmp;
 	}
 
 	// reset file to blank slate
@@ -539,14 +545,16 @@ int fs_lseek(int fd, size_t offset) {
 }
 
 int fs_write_safe(int fd, void *buf, size_t count) {
-	sem_wait(&open_files_write_sem);
+	
 	if (fd <= -1 || fd >= FS_OPEN_MAX_COUNT) {
         fs_error("invalid file descriptor [%d] \n", fd);
         return -1;
 	} else {
+		sem_wait(&(open_files_write_sem[fd]));
 		open_files_write_requests[fd] += 1;
+		sem_post(&(open_files_write_sem[fd]));
 	}
-	sem_post(&open_files_write_sem);
+	
 
 	sem_wait(&root_dir_semaphore);
 	sem_wait(&fd_semaphore);
@@ -556,9 +564,9 @@ int fs_write_safe(int fd, void *buf, size_t count) {
 	sem_post(&fd_semaphore);
 	sem_post(&root_dir_semaphore);
 
-	sem_wait(&open_files_write_sem);
+	sem_wait(&(open_files_write_sem[fd]));
 	open_files_write_requests[fd] -= 1;
-	sem_post(&open_files_write_sem);
+	sem_post(&(open_files_write_sem[fd]));
 	
 	return result;
 }
@@ -707,14 +715,14 @@ Read a File:
 */
 
 int fs_read_safe(int fd, void *buf, size_t count) {
-	sem_wait(&open_files_read_sem);
 	if (fd <= -1 || fd >= FS_OPEN_MAX_COUNT) {
         fs_error("invalid file descriptor [%d] \n", fd);
         return -1;
 	} else {
+		sem_wait(&(open_files_read_sem[fd]));
 		open_files_read_requests[fd] += 1;
+		sem_post(&(open_files_read_sem[fd]));
 	}
-	sem_post(&open_files_read_sem);
 
 	sem_wait(&root_dir_semaphore);
 	sem_wait(&fd_semaphore);
@@ -724,9 +732,9 @@ int fs_read_safe(int fd, void *buf, size_t count) {
 	sem_post(&fd_semaphore);
 	sem_post(&root_dir_semaphore);
 
-	sem_wait(&open_files_read_sem);
+	sem_wait(&(open_files_read_sem[fd]));
 	open_files_read_requests[fd] -= 1;
-	sem_post(&open_files_read_sem);
+	sem_post(&(open_files_read_sem[fd]));
 
 	return result;
 }
