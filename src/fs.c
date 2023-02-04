@@ -56,8 +56,8 @@ struct FAT_t {
 
 // file name struct indicate location of filename in filesName
 struct FILE_NAMES {
-	char     file_name[FS_FILENAME_LEN];
-	bool   is_free; 
+	char	file_name[FS_FILENAME_LEN];
+	bool	is_free; 
 };
 
 
@@ -129,7 +129,7 @@ int fs_mount(const char *diskname) {
 		return -1;
 	}
 	// check for correct signature
-	if(strncmp(superblock->signature, "ECS150FS", 8) != 0){
+	if(strncmp(superblock->signature, "OS_PROJ1", 8) != 0){
 		fs_error( "invalid disk signature \n");
 		return -1;
 	}
@@ -199,6 +199,8 @@ int fs_umount(void) {
 			return -1;
 	}
 
+	// TODO: write data blocks.
+
 	free(superblock);
 	free(root_dir_block);
 	free(FAT_blocks);
@@ -262,7 +264,7 @@ int fs_create(const char *filename) {
 		if(root_dir_block[i].filename[0] == EMPTY) {	
 			// initialize file data 
 			strcpy(root_dir_block[i].filename, filename);
-			root_dir_block[i].file_size     = 0;
+			root_dir_block[i].file_size = 0;
 			root_dir_block[i].start_data_block = EOC;
 			//signal
 	        sem_post(&mutexCreate);
